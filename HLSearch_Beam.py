@@ -215,11 +215,42 @@ def build_shift_table(primes: Sequence[int], cols: int = cfg.cols) -> list[NDArr
     shift_table: list[NDArray[np.bool_]] = []
     for level, p in enumerate(primes):
         row = base_rows[level]
-        shifted_complement = np.empty((p, cols), dtype=bool)
-        for k in range(p):
-            shifted_complement[k] = ~shift_array(row, k)
+        source_indices = np.arange(cols)[None, :] - np.arange(p)[:, None]
+        shifted = np.zeros((p, cols), dtype=bool)
+        valid = source_indices >= 0
+        shifted[valid] = row[source_indices[valid]]
+        shifted_complement = ~shifted
         shift_table.append(shifted_complement)
     return shift_table
+
+
+def _pack_mask(mask: NDArray[np.bool_]) -> NDArray[np.uint64]:
+    """boolマスクをリトルエンディアンのuint64ワードへ詰める。"""
+    packed_bytes = np.packbits(np.asarray(mask, dtype=bool), bitorder="little")
+    word_count = (mask.size + 63) // 64
+    padded = np.pad(packed_bytes, (0, word_count * 8 - packed_bytes.size))
+    return np.frombuffer(padded.tobytes(), dtype="<u8").copy()
+
+
+def _unpack_mask(mask: NDArray[np.uint64], size: int) -> NDArray[np.bool_]:
+    """uint64ワードのマスクを指定サイズのbool配列へ戻す。"""
+    if size == 0:
+        return np.zeros(0, dtype=bool)
+    packed = np.asarray(mask, dtype="<u8").tobytes()
+    return np.unpackbits(
+        np.frombuffer(packed, dtype=np.uint8), bitorder="little"
+    )[:size].astype(bool)
+
+
+def build_packed_shift_table(
+    primes: Sequence[int], cols: int = cfg.cols
+) -> list[NDArray[np.uint64]]:
+    """探索用に、シフトテーブルをuint64へビットパックして生成する。"""
+    return [
+        np.asarray([_pack_mask(row) for row in level], dtype=np.uint64)
+        for level in build_shift_table(primes, cols)
+    ]
+
 
 class State:
     """探索処理の状態を保持し、反復 DFS を実行する。
@@ -254,6 +285,7 @@ class State:
         "_stack",
         "_beam_frontier",
         "_beam_level",
+        "_word_count",
     )
 
     def __init__(self, config: SearchConfig | Sequence[int], shift_table: list[NDArray[np.bool_]], limit: int | None = None, max_depth: int | None = None, target: int | None = None, checkpoint_path: str | os.PathLike[str] | None = None, checkpoint_interval: int = 1000) -> None:
@@ -278,8 +310,14 @@ class State:
 
         self.key: list[int] = []
         self.primes: Sequence[int] = primes
-        self.shift_table: list[NDArray[np.bool_]] = shift_table
-        self.zero_mask: NDArray[np.bool_] = np.ones(self.config.cols, dtype=bool)
+        self.shift_table: list[NDArray[np.uint64]] = [
+            table if table.dtype == np.uint64 else np.asarray(
+                [_pack_mask(row) for row in table], dtype=np.uint64
+            )
+            for table in shift_table
+        ]
+        self._word_count = (self.config.cols + 63) // 64
+        self.zero_mask = self._full_packed_mask()
         self.max_count: int = 0
         self.shifts: list[list[int]] = []
         self.results: int = 0
@@ -288,7 +326,7 @@ class State:
         self.checkpoint_path = Path(checkpoint_path) if checkpoint_path is not None else None
         self.checkpoint_interval = checkpoint_interval
         self._stack: list[list] = []
-        self._beam_frontier: list[tuple[list[int], NDArray[np.bool_], int]] | None = None
+        self._beam_frontier: list[tuple[tuple[int, ...], NDArray[np.uint64], int]] | None = None
         self._beam_level = 0
         self.pbar = tqdm(
             desc="search",
@@ -309,6 +347,8 @@ class State:
         """
         if mask.size == 0:
             return 0
+        if mask.dtype == np.uint64:
+            mask = _unpack_mask(mask, self.config.cols)
         packed = np.packbits(np.asarray(mask, dtype=bool))
         return int.from_bytes(packed.tobytes(), byteorder="big")
 
@@ -319,6 +359,48 @@ class State:
         nbytes = (size + 7) // 8
         packed = np.frombuffer(value.to_bytes(nbytes, byteorder="big"), dtype=np.uint8)
         return np.unpackbits(packed)[:size].astype(bool)
+
+    def _int_to_packed_mask(self, value: int) -> NDArray[np.uint64]:
+        return _pack_mask(self._int_to_mask(value, self.config.cols))
+
+    def _mask_count(self, mask: NDArray[np.uint64]) -> int:
+        """パック済みマスクの1ビット数を返す。"""
+        if hasattr(np, "bitwise_count"):
+            return int(np.bitwise_count(mask).sum())
+        return int(np.unpackbits(mask.view(np.uint8)).sum())
+
+    def _mask_counts(self, masks: NDArray[np.uint64]) -> NDArray[np.int64]:
+        """複数のパック済みマスクの1ビット数を行単位で返す。"""
+        if hasattr(np, "bitwise_count"):
+            return np.asarray(np.bitwise_count(masks).sum(axis=1), dtype=np.int64)
+        byte_masks = masks.view(np.uint8).reshape(masks.shape[0], -1)
+        return np.unpackbits(byte_masks, axis=1).sum(axis=1, dtype=np.int64)
+
+    def _full_packed_mask(self) -> NDArray[np.uint64]:
+        mask = np.full(self._word_count, np.uint64(2**64 - 1), dtype=np.uint64)
+        if self.config.cols % 64:
+            mask[-1] = np.uint64((1 << (self.config.cols % 64)) - 1)
+        return mask
+
+    def _select_beam(
+        self,
+        candidates: list[tuple[tuple[int, ...], NDArray[np.uint64], int]],
+    ) -> list[tuple[tuple[int, ...], NDArray[np.uint64], int]]:
+        """スコア上位の候補を選び、従来と同じキー順で整列する。"""
+        if len(candidates) <= self.beam_width:
+            return sorted(candidates, key=lambda item: (-item[2], item[0]))
+
+        counts = np.fromiter(
+            (candidate[2] for candidate in candidates), dtype=np.int64
+        )
+        partitioned = np.argpartition(-counts, self.beam_width - 1)
+        threshold = counts[partitioned[self.beam_width - 1]]
+        selected = [
+            candidate for candidate, count in zip(candidates, counts)
+            if count >= threshold
+        ]
+        selected.sort(key=lambda item: (-item[2], item[0]))
+        return selected[: self.beam_width]
 
     def _save_checkpoint(self) -> None:
         if self.checkpoint_path is None:
@@ -386,7 +468,7 @@ class State:
             raise ValueError(f"unsupported checkpoint version: {saved.get('version')}")
 
         self.key = list(saved.get("key", []))
-        self.zero_mask = self._int_to_mask(int(saved.get("zero_mask", 0)), self.config.cols)
+        self.zero_mask = self._int_to_packed_mask(int(saved.get("zero_mask", 0)))
         self.max_count = int(saved.get("max_count", 0))
         self.results = int(saved.get("results", 0))
         self.node_count = int(saved.get("node_count", 0))
@@ -395,7 +477,7 @@ class State:
         self._stack = [
             [
                 int(entry["level"]),
-                self._int_to_mask(int(entry["base_mask"]), self.config.cols),
+                self._int_to_packed_mask(int(entry["base_mask"])),
                 int(entry["next_idx"]),
                 int(entry["next_p"]),
             ]
@@ -406,8 +488,8 @@ class State:
             self._beam_level = int(saved.get("beam_level", 0))
             self._beam_frontier = [
                 (
-                    list(entry["key"]),
-                    self._int_to_mask(int(entry["mask"]), self.config.cols),
+                    tuple(entry["key"]),
+                    self._int_to_packed_mask(int(entry["mask"])),
                     int(entry["count"]),
                 )
                 for entry in raw_frontier
@@ -434,6 +516,13 @@ class State:
         if self.checkpoint_path is not None and self.node_count % self.checkpoint_interval == 0:
             self._save_checkpoint()
 
+    def _maybe_report_progress(self) -> None:
+        interval = self.config.postfix_update_interval
+        if self.checkpoint_path is not None:
+            interval = min(interval, self.checkpoint_interval)
+        if self.node_count % interval == 0:
+            self.report_progress()
+
     def search(self, depth: int) -> None:
         """
         各階層のシフト値をビームサーチで探索する。
@@ -450,23 +539,24 @@ class State:
             return
 
         frontier = self._beam_frontier or [
-            ([], self.zero_mask.copy(), int(np.count_nonzero(self.zero_mask)))
+            ((), self.zero_mask.copy(), self._mask_count(self.zero_mask))
         ]
         for level in range(self._beam_level, depth):
-            candidates: list[tuple[list[int], NDArray[np.bool_], int]] = []
+            candidates: list[tuple[tuple[int, ...], NDArray[np.uint64], int]] = []
             for key, base_mask, _ in frontier:
-                for shift in range(self.primes[level]):
+                node_masks = base_mask & self.shift_table[level]
+                counts = self._mask_counts(node_masks)
+                for shift, count_value in enumerate(counts):
                     self.node_count += 1
-                    node_mask = base_mask & self.shift_table[level][shift]
-                    count = int(np.count_nonzero(node_mask))
+                    node_mask = node_masks[shift]
+                    count = int(count_value)
                     if count < max(self.limit, self.max_count):
-                        self.report_progress()
+                        self._maybe_report_progress()
                         continue
-                    candidates.append((key + [shift], node_mask, count))
-                    self.report_progress()
+                    candidates.append((key + (shift,), node_mask, count))
+                    self._maybe_report_progress()
 
-            candidates.sort(key=lambda item: (-item[2], item[0]))
-            frontier = candidates[: self.beam_width]
+            frontier = self._select_beam(candidates)
             self._beam_frontier = frontier
             self._beam_level = level + 1
             if level + 1 == depth:
@@ -476,17 +566,15 @@ class State:
                         self.pbar.write(message)
                         logger.info(message)
                         self.results += 1
-                        self.shifts.append(key)
+                        self.shifts.append(list(key))
                     if not (depth == self.max_depth and count > self.target):
                         self.max_count = max(self.max_count, count)
             if not frontier:
                 break
 
-        self.zero_mask = frontier[0][1] if frontier else np.ones(
-            self.config.cols, dtype=bool
-        )
+        self.zero_mask = frontier[0][1] if frontier else self._full_packed_mask()
 
-        self.key = frontier[0][0] if frontier else []
+        self.key = list(frontier[0][0]) if frontier else []
         return
 
     def _search_dfs(self, depth: int) -> None:
@@ -530,7 +618,7 @@ class State:
             try:
                 row_complement = self.shift_table[level][i]  # ~row_nonzero(NOT演算済み、事前作成済み)
                 node_mask = base_mask & row_complement
-                count = int(np.count_nonzero(node_mask))
+                count = self._mask_count(node_mask)
 
                 if count < max(self.limit, self.max_count):
                     key.pop()
@@ -557,7 +645,7 @@ class State:
                 next_p_child = self.primes[level + 1]
                 stack.append([level + 1, node_mask, 0, next_p_child])
             finally:
-                self.report_progress()
+                self._maybe_report_progress()
 
     def run(self, depth: int | None = None, resume_from: str | os.PathLike[str] | None = None) -> "State":
         """primes[:depth] を使って深さ depth までの探索を実行するエントリポイント"""
@@ -655,7 +743,7 @@ if __name__ == "__main__":
     logger.info("HLSearch_Beam 開始 (log file: %s)", LOG_PATH)
     logger.info("設定: depth=%d limit=%d max_depth=%d target=%d beam_width=%d primes_count=%d", depth, limit, max_depth, target, beam_width, len(primes))
 
-    shift_table = build_shift_table(primes[:depth], cols)
+    shift_table = build_packed_shift_table(primes[:depth], cols)
     state = State(config, shift_table, checkpoint_path=args.checkpoint, checkpoint_interval=max(1, min(10000, max(10, depth * 100))))
     result_state = state.run(depth, resume_from=args.resume)
 
