@@ -7,12 +7,23 @@ HLSearchの素数シフト探索にビームサーチを適用したPythonプロ
 - Python 3.13以降
 - NumPy
 - tqdm
+- CUDAを使う場合: CUDA Toolkitに対応したCuPy
 
-依存パッケージをインストールします。
+CPU版の依存パッケージをインストールします。
 
 ```bat
 python -m pip install numpy tqdm
 ```
+
+CUDA版を使う場合は、CUDA Toolkitのバージョンに合うCuPyを追加します。
+たとえばCUDA 12.xでは次のようにインストールします。
+
+```bat
+python -m pip install cupy-cuda12x
+```
+
+CUDA 11.xなど別のバージョンを使用する場合は、CuPy公式の対応表に
+従ってパッケージ名を選択してください。
 
 ## 基本実行
 
@@ -34,6 +45,9 @@ python HLSearch_Beam.py --depth 10 --beam-width 100
 | `--output PATH` | シフト経路の出力先 |
 | `--checkpoint PATH` | 探索途中のチェックポイント保存先 |
 | `--resume PATH` | 保存済みチェックポイントから再開 |
+| `--backend {cpu,cuda}` | 探索バックエンド（既定値: `cpu`）。`cuda`はCuPyが必要 |
+| `--benchmark` | 小規模CPUベンチマークを実行して終了 |
+| `--benchmark-repeats N` | CPUベンチマークの反復回数 |
 
 小規模な動作確認:
 
@@ -71,8 +85,23 @@ results:...
 - シフトテーブルをNumPyで一括生成
 - 進捗表示とチェックポイント判定の頻度を抑制
 
-現在の探索バックエンドはCPU版です。CUDAを使用するには、
-候補評価・popcount・上位候補選択をGPU上でバッチ処理する専用バックエンドが必要です。
+`--backend cuda`を指定すると、シフトテーブルをGPUへ転送し、候補のAND演算と
+popcountをCuPyでバッチ処理します。ビームの並べ替えやチェックポイントの
+シリアライズはCPU側で行います。CUDA対応GPUまたは対応するCuPyが利用できない
+環境では実行できません。
+
+```bat
+python HLSearch_Beam.py --backend cuda --depth 10 --beam-width 100
+```
+
+CPU性能を測定するには、検索と同じCLIから小規模ベンチマークを実行できます。
+ベンチマークは常にCPUバックエンドで実行され、結果はJSONで標準出力に表示されます。
+`elapsed_seconds`は全反復の合計時間、`nodes_per_second`は全反復の平均処理速度です。
+
+```bat
+python HLSearch_Beam.py --benchmark --depth 6 --primes-count 6 ^
+  --cols 1024 --beam-width 64 --benchmark-repeats 3
+```
 
 ## テスト
 

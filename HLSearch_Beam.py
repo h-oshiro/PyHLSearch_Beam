@@ -30,6 +30,11 @@ import numpy as np
 from numpy.typing import NDArray
 from tqdm import tqdm
 
+try:
+    import cupy as cp
+except ImportError:  # CUDA is an optional backend.
+    cp = None
+
 
 def generate_primes(limit: int) -> list[int]:
     """limit 以下の素数を昇順で返す。
@@ -66,6 +71,7 @@ class SearchConfig:
         progress_mininterval: tqdm の最短更新間隔。
         postfix_update_interval: postfix 更新の頻度。
         shift_path_file: 出力ファイルパス.
+        backend: 探索バックエンド(`cpu`または`cuda`).
     """
     primes: list[int] = field(default_factory=lambda: generate_primes(1579))
     nums: list[list[int]] = field(default_factory=lambda: [
@@ -93,6 +99,7 @@ class SearchConfig:
     postfix_update_interval: int = 10000
     shift_path_file: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shift_path.txt")
     beam_width: int = 100
+    backend: str = "cpu"
 
     def __post_init__(self) -> None:
         """設定値の整合性を早期に検証する(実行時ではなく構築時に失敗させる)。"""
@@ -114,6 +121,10 @@ class SearchConfig:
             raise ValueError(
                 f"postfix_update_interval は正の整数である必要があります: "
                 f"postfix_update_interval={self.postfix_update_interval}"
+            )
+        if self.backend not in {"cpu", "cuda"}:
+            raise ValueError(
+                f"backend は cpu または cuda である必要があります: backend={self.backend}"
             )
 
 cfg = SearchConfig()
@@ -282,6 +293,8 @@ class State:
         "pbar",
         "checkpoint_path",
         "checkpoint_interval",
+        "backend",
+        "_xp",
         "_stack",
         "_beam_frontier",
         "_beam_level",
@@ -307,6 +320,16 @@ class State:
         self.max_depth = config.max_depth if max_depth is None else max_depth
         self.target = config.target if target is None else target
         self.beam_width = config.beam_width
+        self.backend = config.backend
+        if self.backend == "cuda":
+            if cp is None:
+                raise RuntimeError(
+                    "CUDAバックエンドにはCuPyが必要です。"
+                    "CUDA対応版のCuPyをインストールしてください。"
+                )
+            self._xp = cp
+        else:
+            self._xp = np
 
         self.key: list[int] = []
         self.primes: Sequence[int] = primes
@@ -316,6 +339,8 @@ class State:
             )
             for table in shift_table
         ]
+        if self.backend == "cuda":
+            self.shift_table = [self._xp.asarray(table) for table in self.shift_table]
         self._word_count = (self.config.cols + 63) // 64
         self.zero_mask = self._full_packed_mask()
         self.max_count: int = 0
@@ -347,6 +372,8 @@ class State:
         """
         if mask.size == 0:
             return 0
+        if self.backend == "cuda":
+            mask = cp.asnumpy(mask)
         if mask.dtype == np.uint64:
             mask = _unpack_mask(mask, self.config.cols)
         packed = np.packbits(np.asarray(mask, dtype=bool))
@@ -365,12 +392,21 @@ class State:
 
     def _mask_count(self, mask: NDArray[np.uint64]) -> int:
         """パック済みマスクの1ビット数を返す。"""
+        if self.backend == "cuda":
+            mask = cp.asarray(mask)
+            return int(cp.unpackbits(mask.view(cp.uint8)).sum().item())
         if hasattr(np, "bitwise_count"):
             return int(np.bitwise_count(mask).sum())
         return int(np.unpackbits(mask.view(np.uint8)).sum())
 
     def _mask_counts(self, masks: NDArray[np.uint64]) -> NDArray[np.int64]:
         """複数のパック済みマスクの1ビット数を行単位で返す。"""
+        if self.backend == "cuda":
+            masks = cp.asarray(masks)
+            unpacked = cp.unpackbits(masks.view(cp.uint8)).reshape(
+                masks.shape[0], -1
+            )
+            return unpacked.sum(axis=1, dtype=cp.int64).get()
         if hasattr(np, "bitwise_count"):
             return np.asarray(np.bitwise_count(masks).sum(axis=1), dtype=np.int64)
         byte_masks = masks.view(np.uint8).reshape(masks.shape[0], -1)
@@ -489,7 +525,7 @@ class State:
             self._beam_frontier = [
                 (
                     tuple(entry["key"]),
-                    self._int_to_packed_mask(int(entry["mask"])),
+                    self._xp.asarray(self._int_to_packed_mask(int(entry["mask"]))),
                     int(entry["count"]),
                 )
                 for entry in raw_frontier
@@ -539,7 +575,11 @@ class State:
             return
 
         frontier = self._beam_frontier or [
-            ((), self.zero_mask.copy(), self._mask_count(self.zero_mask))
+            (
+                (),
+                self._xp.asarray(self.zero_mask.copy()),
+                self._mask_count(self.zero_mask),
+            )
         ]
         for level in range(self._beam_level, depth):
             candidates: list[tuple[tuple[int, ...], NDArray[np.uint64], int]] = []
@@ -667,6 +707,60 @@ class State:
         return self
 
 
+def benchmark_cpu(
+    *,
+    depth: int = 6,
+    primes_count: int = 6,
+    cols: int = 1024,
+    beam_width: int = 64,
+    repeats: int = 3,
+) -> dict[str, float | int]:
+    """小規模なCPU探索を繰り返し、処理時間とノード処理速度を返す。"""
+    if repeats <= 0:
+        raise ValueError(f"repeats は正の整数である必要があります: repeats={repeats}")
+    if depth <= 0 or depth > primes_count:
+        raise ValueError(
+            f"depth は1以上かつprimes_count以下である必要があります: "
+            f"depth={depth}, primes_count={primes_count}"
+        )
+    primes = PRIMES[:primes_count]
+    config = SearchConfig(
+        primes=primes,
+        depth=depth,
+        limit=0,
+        max_depth=depth + 1,
+        target=0,
+        cols=cols,
+        beam_width=beam_width,
+        progress_mininterval=0,
+        postfix_update_interval=max(1, cols),
+        backend="cpu",
+    )
+    shift_table = build_packed_shift_table(primes[:depth], cols)
+    elapsed = 0.0
+    nodes = 0
+    result = None
+    for _ in range(repeats):
+        state = State(config, shift_table)
+        started = time.perf_counter()
+        result = state.run()
+        elapsed += time.perf_counter() - started
+        nodes += state.node_count
+    assert result is not None
+    return {
+        "backend": "cpu",
+        "repeats": repeats,
+        "depth": depth,
+        "cols": cols,
+        "beam_width": beam_width,
+        "elapsed_seconds": elapsed,
+        "nodes": nodes,
+        "nodes_per_second": nodes / elapsed if elapsed else 0.0,
+        "max_count": result.max_count,
+        "results": result.results,
+    }
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """CLI 引数を解釈して探索設定を返す。
 
@@ -704,6 +798,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="途中経過をJSON形式で保存するパス。再開時は --resume を使う。")
     parser.add_argument("--resume", type=str, default=None,
                         help="保存済み checkpoint から探索を再開する。")
+    parser.add_argument("--backend", choices=["cpu", "cuda"], default=argparse.SUPPRESS,
+                        help="探索に使うバックエンド。cudaにはCUDA対応CuPyが必要。")
+    parser.add_argument("--benchmark", action="store_true", default=argparse.SUPPRESS,
+                        help="小規模CPUベンチマークを実行して終了する。")
+    parser.add_argument("--benchmark-repeats", type=int, default=argparse.SUPPRESS,
+                        help="CPUベンチマークの反復回数。")
     return parser.parse_args(argv)
 
 
@@ -711,6 +811,18 @@ if __name__ == "__main__":
     script_name = os.path.basename(sys.argv[0]).lower()
     argv = sys.argv[1:] if script_name not in {"pytest", "py.test"} else []
     args = parse_args(argv)
+
+    backend = getattr(args, "backend", cfg.backend)
+    if getattr(args, "benchmark", False):
+        benchmark = benchmark_cpu(
+            depth=min(args.depth, args.primes_count or args.depth),
+            primes_count=args.primes_count or args.depth,
+            cols=args.cols,
+            beam_width=args.beam_width,
+            repeats=getattr(args, "benchmark_repeats", 3),
+        )
+        print(json.dumps(benchmark, ensure_ascii=False, indent=2))
+        raise SystemExit(0)
 
     base = os.path.dirname(os.path.abspath(__file__))
     LOG_PATH = setup_logging(base, console_level=args.log_level)
@@ -738,10 +850,11 @@ if __name__ == "__main__":
         progress_mininterval=args.mininterval,
         postfix_update_interval=cfg.postfix_update_interval,
         shift_path_file=output_path,
+        backend=backend,
     )
 
     logger.info("HLSearch_Beam 開始 (log file: %s)", LOG_PATH)
-    logger.info("設定: depth=%d limit=%d max_depth=%d target=%d beam_width=%d primes_count=%d", depth, limit, max_depth, target, beam_width, len(primes))
+    logger.info("設定: depth=%d limit=%d max_depth=%d target=%d beam_width=%d primes_count=%d backend=%s", depth, limit, max_depth, target, beam_width, len(primes), backend)
 
     shift_table = build_packed_shift_table(primes[:depth], cols)
     state = State(config, shift_table, checkpoint_path=args.checkpoint, checkpoint_interval=max(1, min(10000, max(10, depth * 100))))
