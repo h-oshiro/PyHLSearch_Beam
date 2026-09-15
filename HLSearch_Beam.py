@@ -64,13 +64,13 @@ class SearchConfig:
         primes: 探索対象の素数リスト。デフォルトでは 1579 以下の素数を生成する。
         nums: 探索キーのリスト。
         depth: 深さとして使う素数の数。
-        limit: 枝刈りの下限値。
         max_depth: 深さの上限。
         target: `depth == max_depth` のときの打ち切り目標値.
         cols: 列数。
         progress_mininterval: tqdm の最短更新間隔。
         postfix_update_interval: postfix 更新の頻度。
         shift_path_file: 出力ファイルパス.
+        beam_width: 次レベルへ渡す候補数の上限。指定時は beam_max_candidates より優先する。
         beam_top_k: 次レベルへ渡す際に採用する count の上位順位数(タイは全て含む)。
         beam_max_candidates: 1レベルあたりに次へ渡す候補数の上限。
         backend: 探索バックエンド(`cpu`または`cuda`).
@@ -93,13 +93,13 @@ class SearchConfig:
         1451, 1453, 1459, 1471, 1481, 1483, 1487, 1489, 1493, 1499, 1511, 1513, 1517, 1523, 1531, 1543, 1549, 1553, 1559, 1567, 1571, 1579
     ])
     depth: int = 8
-    limit: int = 447
     max_depth: int = 249
     target: int = 447
     cols: int = 3159
     progress_mininterval: float = 1.0
     postfix_update_interval: int = 10000
     shift_path_file: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shift_path.txt")
+    beam_width: int | None = None
     beam_top_k: int = 2
     beam_max_candidates: int = 5000
     backend: str = "cpu"
@@ -114,8 +114,10 @@ class SearchConfig:
             raise ValueError(
                 f"depth={self.depth} が primes の要素数({len(self.primes)})を超えています"
             )
-        if self.limit < 0:
-            raise ValueError(f"limit は0以上である必要があります: limit={self.limit}")
+        if self.beam_width is not None and self.beam_width <= 0:
+            raise ValueError(
+                f"beam_width は正の整数である必要があります: beam_width={self.beam_width}"
+            )
         if self.beam_top_k <= 0:
             raise ValueError(
                 f"beam_top_k は正の整数である必要があります: beam_top_k={self.beam_top_k}"
@@ -172,8 +174,6 @@ def setup_logging(base_dir: str | os.PathLike[str], console_level: str="INFO") -
 
 
 # COLS: int = cfg.cols
-# LIMIT: int = cfg.limit
-
 # DEPTH: int = cfg.depth
 # MAX_DEPTH: int = cfg.max_depth
 # TARGET: int = cfg.target
@@ -289,9 +289,9 @@ class State:
         "primes",
         "shift_table",
         "zero_mask",
-        "limit",
         "max_depth",
         "target",
+        "beam_width",
         "beam_top_k",
         "beam_max_candidates",
         "max_count",
@@ -310,24 +310,23 @@ class State:
         "_word_count",
     )
 
-    def __init__(self, config: SearchConfig | Sequence[int], shift_table: list[NDArray[np.bool_]], limit: int | None = None, max_depth: int | None = None, target: int | None = None, checkpoint_path: str | os.PathLike[str] | None = None, checkpoint_interval: int = 1000) -> None:
+    def __init__(self, config: SearchConfig | Sequence[int], shift_table: list[NDArray[np.bool_]], max_depth: int | None = None, target: int | None = None, checkpoint_path: str | os.PathLike[str] | None = None, checkpoint_interval: int = 1000) -> None:
         # SearchConfig 以外(生の primes 列)が渡された場合は、まず SearchConfig に
         # 正規化してしまう。これにより以降の属性代入を両ケースで共通化でき、
-        # limit/max_depth/target の決定ロジックを二重に書かずに済む。
+        # max_depth/target の決定ロジックを二重に書かずに済む。
         if not isinstance(config, SearchConfig):
             config = SearchConfig(
                 primes=config,
                 depth=len(config),
-                limit=cfg.limit if limit is None else limit,
                 max_depth=cfg.max_depth if max_depth is None else max_depth,
                 target=cfg.target if target is None else target,
                 cols=cfg.cols,
             )
         self.config = config
         primes = config.primes
-        self.limit = config.limit if limit is None else limit
         self.max_depth = config.max_depth if max_depth is None else max_depth
         self.target = config.target if target is None else target
+        self.beam_width = config.beam_width
         self.beam_top_k = config.beam_top_k
         self.beam_max_candidates = config.beam_max_candidates
         self.backend = config.backend
@@ -456,7 +455,12 @@ class State:
             if count >= threshold
         ]
         selected.sort(key=lambda item: (-item[2], item[0]))
-        return selected[: self.beam_max_candidates]
+        candidate_limit = (
+            self.beam_width
+            if self.beam_width is not None
+            else self.beam_max_candidates
+        )
+        return selected[:candidate_limit]
 
     def _save_checkpoint(self) -> None:
         if self.checkpoint_path is None:
@@ -612,7 +616,7 @@ class State:
                     self.node_count += 1
                     node_mask = node_masks[shift]
                     count = int(count_value)
-                    if count < max(self.limit, self.max_count):
+                    if count < self.max_count:
                         self._maybe_report_progress()
                         continue
                     candidates.append((key + (shift,), node_mask, count))
@@ -682,7 +686,7 @@ class State:
                 node_mask = base_mask & row_complement
                 count = self._mask_count(node_mask)
 
-                if count < max(self.limit, self.max_count):
+                if count < self.max_count:
                     key.pop()
                     continue
 
@@ -734,6 +738,7 @@ def benchmark_cpu(
     depth: int = 6,
     primes_count: int = 6,
     cols: int = 1024,
+    beam_width: int | None = None,
     beam_top_k: int = 2,
     beam_max_candidates: int = 5000,
     repeats: int = 3,
@@ -750,10 +755,10 @@ def benchmark_cpu(
     config = SearchConfig(
         primes=primes,
         depth=depth,
-        limit=0,
         max_depth=depth + 1,
         target=0,
         cols=cols,
+        beam_width=beam_width,
         beam_top_k=beam_top_k,
         beam_max_candidates=beam_max_candidates,
         progress_mininterval=0,
@@ -776,6 +781,7 @@ def benchmark_cpu(
         "repeats": repeats,
         "depth": depth,
         "cols": cols,
+        "beam_width": beam_width,
         "beam_top_k": beam_top_k,
         "beam_max_candidates": beam_max_candidates,
         "elapsed_seconds": elapsed,
@@ -801,16 +807,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("-d", "--depth", type=int, default=cfg.depth,
                         help="探索する階層数(使用する素数の個数)。primesの長さ以下である必要がある。")
-    parser.add_argument("-l", "--limit", type=int, default=cfg.limit,
-                        help="打ち切りに使うcountの下限値。これ未満の枝は探索しない。")
     parser.add_argument("--max-depth", type=int, default=cfg.max_depth,
                         help="depthがこの値と一致するとき、--targetによる追加打ち切りを有効にする。")
     parser.add_argument("-t", "--target", type=int, default=cfg.target,
                         help="depth == max-depth のとき、countがこの値を超えたら結果を採用せず打ち切る。")
-    parser.add_argument("--beam-top-k", type=int, default=cfg.beam_top_k,
+    beam_limit_group = parser.add_mutually_exclusive_group()
+    beam_limit_group.add_argument("--beam-width", type=int, default=argparse.SUPPRESS,
+                                  help="各階層から次の階層へ渡す候補数の上限。")
+    beam_limit_group.add_argument("--beam-max-candidates", type=int, default=argparse.SUPPRESS,
+                                  help="各階層から次の階層へ渡す候補数の上限。")
+    parser.add_argument("--beam-top-k", type=int, default=argparse.SUPPRESS,
                         help="各階層でcountの上位何位まで(タイは全て含む)を次の階層へ渡すか。")
-    parser.add_argument("--beam-max-candidates", type=int, default=cfg.beam_max_candidates,
-                        help="各階層から次の階層へ渡す候補数の上限。")
     parser.add_argument("-p", "--primes-count", type=int, default=None, metavar="N",
                         help="PRIMESの先頭N個だけを使う(未指定なら全て使用)。")
     parser.add_argument("--cols", type=int, default=cfg.cols,
@@ -845,8 +852,11 @@ if __name__ == "__main__":
             depth=min(args.depth, args.primes_count or args.depth),
             primes_count=args.primes_count or args.depth,
             cols=args.cols,
-            beam_top_k=args.beam_top_k,
-            beam_max_candidates=args.beam_max_candidates,
+            beam_width=getattr(args, "beam_width", None),
+            beam_top_k=getattr(args, "beam_top_k", cfg.beam_top_k),
+            beam_max_candidates=getattr(
+                args, "beam_max_candidates", cfg.beam_max_candidates
+            ),
             repeats=getattr(args, "benchmark_repeats", 3),
         )
         print(json.dumps(benchmark, ensure_ascii=False, indent=2))
@@ -856,11 +866,13 @@ if __name__ == "__main__":
     LOG_PATH = setup_logging(base, console_level=args.log_level)
 
     depth = args.depth
-    limit = args.limit
     max_depth = args.max_depth
     target = args.target
-    beam_top_k = args.beam_top_k
-    beam_max_candidates = args.beam_max_candidates
+    beam_width = getattr(args, "beam_width", None)
+    beam_top_k = getattr(args, "beam_top_k", cfg.beam_top_k)
+    beam_max_candidates = getattr(
+        args, "beam_max_candidates", cfg.beam_max_candidates
+    )
     cols = args.cols
     primes = PRIMES if args.primes_count is None else PRIMES[: args.primes_count]
     output_path = args.output
@@ -871,9 +883,9 @@ if __name__ == "__main__":
     config = SearchConfig(
         primes=primes,
         depth=depth,
-        limit=limit,
         max_depth=max_depth,
         target=target,
+        beam_width=beam_width,
         beam_top_k=beam_top_k,
         beam_max_candidates=beam_max_candidates,
         cols=cols,
@@ -885,8 +897,9 @@ if __name__ == "__main__":
 
     logger.info("HLSearch_Beam 開始 (log file: %s)", LOG_PATH)
     logger.info(
-        "設定: depth=%d limit=%d max_depth=%d target=%d beam_top_k=%d beam_max_candidates=%d primes_count=%d backend=%s",
-        depth, limit, max_depth, target, beam_top_k, beam_max_candidates, len(primes), backend,
+        "設定: depth=%d max_depth=%d target=%d beam_width=%s beam_top_k=%d beam_max_candidates=%d primes_count=%d backend=%s",
+        depth, max_depth, target, beam_width, beam_top_k,
+        beam_max_candidates, len(primes), backend,
     )
 
     shift_table = build_packed_shift_table(primes[:depth], cols)

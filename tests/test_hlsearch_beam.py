@@ -69,7 +69,6 @@ def test_build_shift_table_contains_shifted_complements():
         {"cols": 0},
         {"depth": -1},
         {"depth": 2, "primes": [2]},
-        {"limit": -1},
         {"beam_width": 0},
         {"postfix_update_interval": 0},
     ],
@@ -84,8 +83,6 @@ def test_parse_args_applies_cli_overrides():
         [
             "--depth",
             "2",
-            "--limit",
-            "3",
             "--max-depth",
             "4",
             "--target",
@@ -111,7 +108,6 @@ def test_parse_args_applies_cli_overrides():
 
     assert vars(args) == {
         "depth": 2,
-        "limit": 3,
         "max_depth": 4,
         "target": 5,
         "beam_width": 6,
@@ -125,11 +121,15 @@ def test_parse_args_applies_cli_overrides():
     }
 
 
+def test_parse_args_rejects_removed_limit_option():
+    with pytest.raises(SystemExit):
+        parse_args(["--limit", "0"])
+
+
 def make_small_config(**overrides):
     values = {
         "primes": [2, 3],
         "depth": 2,
-        "limit": 0,
         "max_depth": 2,
         "target": 2,
         "cols": 6,

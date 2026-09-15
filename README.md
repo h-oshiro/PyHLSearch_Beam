@@ -28,7 +28,7 @@ CUDA 11.xなど別のバージョンを使用する場合は、CuPy公式の対�
 ## 基本実行
 
 ```bat
-python HLSearch_Beam.py --depth 10 --beam-top-k 2 --beam-max-candidates 5000
+python HLSearch_Beam.py --depth 10 --beam-width 5000
 ```
 
 主なオプション:
@@ -36,9 +36,9 @@ python HLSearch_Beam.py --depth 10 --beam-top-k 2 --beam-max-candidates 5000
 | オプション | 説明 |
 | --- | --- |
 | `--depth N` | 探索する階層数 |
-| `--limit N` | 枝刈りする残存数の下限 |
 | `--max-depth N` | `--target`による追加条件を有効にする深さ |
 | `--target N` | 対象とする残存数 |
+| `--beam-width N` | 次の階層へ渡す候補数の上限。`--beam-max-candidates` の互換オプション |
 | `--beam-top-k N` | 残存数が上位 N 位までの候補を次の階層へ渡す。同順位はすべて対象 |
 | `--beam-max-candidates N` | 次の階層へ渡す候補数の上限 |
 | `--primes-count N` | 使用する素数の個数 |
@@ -56,8 +56,8 @@ python HLSearch_Beam.py --depth 10 --beam-top-k 2 --beam-max-candidates 5000
 
 ```bat
 python HLSearch_Beam.py --depth 2 --primes-count 2 --cols 6 ^
-  --limit 0 --max-depth 2 --target 2 ^
-  --beam-top-k 2 --beam-max-candidates 6
+  --max-depth 2 --target 2 ^
+  --beam-width 6
 ```
 
 ## 出力
@@ -78,7 +78,7 @@ results:...
 
 各階層で候補を評価し、残存数の値が上位 `--beam-top-k` 位までの候補を
 次の階層へ渡します。同順位の候補はすべて対象ですが、候補数が
-`--beam-max-candidates` を超える場合は、残存数の降順・シフト経路の辞書順で
+`--beam-width`（または既存の`--beam-max-candidates`）を超える場合は、残存数の降順・シフト経路の辞書順で
 上限までに絞ります。これらの値を小さくすると高速になりますが、探索対象が絞られるため、
 完全探索とは異なる結果になる場合があります。最適解の完全性が必要な場合は、
 ビーム選択と枝刈り条件の影響を考慮してください。
@@ -97,8 +97,7 @@ popcountをCuPyでバッチ処理します。ビームの並べ替えやチェ�
 環境では実行できません。
 
 ```bat
-python HLSearch_Beam.py --backend cuda --depth 10 --beam-top-k 2 ^
-  --beam-max-candidates 5000
+python HLSearch_Beam.py --backend cuda --depth 10 --beam-width 5000
 ```
 
 CPU性能を測定するには、検索と同じCLIから小規模ベンチマークを実行できます。
@@ -107,7 +106,7 @@ CPU性能を測定するには、検索と同じCLIから小規模ベンチマ�
 
 ```bat
 python HLSearch_Beam.py --benchmark --depth 6 --primes-count 6 ^
-  --cols 1024 --beam-top-k 2 --beam-max-candidates 64 ^
+  --cols 1024 --beam-width 64 ^
   --benchmark-repeats 3
 ```
 
