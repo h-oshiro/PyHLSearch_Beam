@@ -71,6 +71,8 @@ class SearchConfig:
         progress_mininterval: tqdm の最短更新間隔。
         postfix_update_interval: postfix 更新の頻度。
         shift_path_file: 出力ファイルパス.
+        beam_top_k: 次レベルへ渡す際に採用する count の上位順位数(タイは全て含む)。
+        beam_max_candidates: 1レベルあたりに次へ渡す候補数の上限。
         backend: 探索バックエンド(`cpu`または`cuda`).
     """
     primes: list[int] = field(default_factory=lambda: generate_primes(1579))
@@ -98,7 +100,8 @@ class SearchConfig:
     progress_mininterval: float = 1.0
     postfix_update_interval: int = 10000
     shift_path_file: str = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shift_path.txt")
-    beam_width: int = 100
+    beam_top_k: int = 2
+    beam_max_candidates: int = 5000
     backend: str = "cpu"
 
     def __post_init__(self) -> None:
@@ -113,9 +116,14 @@ class SearchConfig:
             )
         if self.limit < 0:
             raise ValueError(f"limit は0以上である必要があります: limit={self.limit}")
-        if self.beam_width <= 0:
+        if self.beam_top_k <= 0:
             raise ValueError(
-                f"beam_width は正の整数である必要があります: beam_width={self.beam_width}"
+                f"beam_top_k は正の整数である必要があります: beam_top_k={self.beam_top_k}"
+            )
+        if self.beam_max_candidates <= 0:
+            raise ValueError(
+                f"beam_max_candidates は正の整数である必要があります: "
+                f"beam_max_candidates={self.beam_max_candidates}"
             )
         if self.postfix_update_interval <= 0:
             raise ValueError(
@@ -284,7 +292,8 @@ class State:
         "limit",
         "max_depth",
         "target",
-        "beam_width",
+        "beam_top_k",
+        "beam_max_candidates",
         "max_count",
         "shifts",
         "results",
@@ -319,7 +328,8 @@ class State:
         self.limit = config.limit if limit is None else limit
         self.max_depth = config.max_depth if max_depth is None else max_depth
         self.target = config.target if target is None else target
-        self.beam_width = config.beam_width
+        self.beam_top_k = config.beam_top_k
+        self.beam_max_candidates = config.beam_max_candidates
         self.backend = config.backend
         if self.backend == "cuda":
             if cp is None:
@@ -422,21 +432,31 @@ class State:
         self,
         candidates: list[tuple[tuple[int, ...], NDArray[np.uint64], int]],
     ) -> list[tuple[tuple[int, ...], NDArray[np.uint64], int]]:
-        """スコア上位の候補を選び、従来と同じキー順で整列する。"""
-        if len(candidates) <= self.beam_width:
-            return sorted(candidates, key=lambda item: (-item[2], item[0]))
+        """count の上位 `beam_top_k` 位までの候補(タイは全て含む)を、
+        `beam_max_candidates` 件を上限として次レベルへ採用する。
+
+        従来の「count 上位 beam_width 件」方式とは異なり、まず count の
+        値そのものを降順に並べて上位 `beam_top_k` 種類(=上位2位まで、
+        など)を残す境界値(threshold)を決め、その境界値以上の候補を
+        すべて集める。その後 count 降順・key 昇順で整列し、
+        `beam_max_candidates` 件を超える場合はそこで打ち切る。
+        """
+        if not candidates:
+            return []
 
         counts = np.fromiter(
             (candidate[2] for candidate in candidates), dtype=np.int64
         )
-        partitioned = np.argpartition(-counts, self.beam_width - 1)
-        threshold = counts[partitioned[self.beam_width - 1]]
+        unique_counts = np.unique(counts)[::-1]  # 降順の重複なしcount値
+        top_k = min(self.beam_top_k, unique_counts.size)
+        threshold = unique_counts[top_k - 1]
+
         selected = [
             candidate for candidate, count in zip(candidates, counts)
             if count >= threshold
         ]
         selected.sort(key=lambda item: (-item[2], item[0]))
-        return selected[: self.beam_width]
+        return selected[: self.beam_max_candidates]
 
     def _save_checkpoint(self) -> None:
         if self.checkpoint_path is None:
@@ -563,9 +583,11 @@ class State:
         """
         各階層のシフト値をビームサーチで探索する。
 
-        各階層で生成した候補を残存数(count)の降順に並べ、上位
-        `beam_width` 件だけを次の階層へ渡す。候補数がビーム幅以下の
-        場合は全候補を保持するため、小さな探索では完全探索と同じ結果になる。
+        各階層で生成した候補を残存数(count)の降順に並べ、count の値が
+        上位 `beam_top_k` 位以内(タイは全て含む)のものだけを、最大
+        `beam_max_candidates` 件まで次の階層へ渡す。候補の異なる count
+        の種類数が `beam_top_k` 以下の場合は全候補を保持するため、
+        小さな探索では完全探索と同じ結果になる。
         """
         self._search_beam(depth)
 
@@ -606,9 +628,9 @@ class State:
                         self.pbar.write(message)
                         logger.info(message)
                         self.results += 1
-                        self.shifts.append(list(key))
                     if not (depth == self.max_depth and count > self.target):
                         self.max_count = max(self.max_count, count)
+                        self.shifts.append(list(key))
             if not frontier:
                 break
 
@@ -670,13 +692,13 @@ class State:
                         self.pbar.write(message)
                         logger.info(message)  # ログファイルにも残す(pbar.writeだけだと画面にしか出ない)
                         self.results += 1
-                        self.shifts.append(list(key))
 
                     if not (depth == self.max_depth and count > self.target):
                         if count > self.max_count:
                             self.max_count = count
                         elif count == self.max_count:
                             pass
+                        self.shifts.append(list(key))
 
                     key.pop()
                     continue
@@ -712,7 +734,8 @@ def benchmark_cpu(
     depth: int = 6,
     primes_count: int = 6,
     cols: int = 1024,
-    beam_width: int = 64,
+    beam_top_k: int = 2,
+    beam_max_candidates: int = 5000,
     repeats: int = 3,
 ) -> dict[str, float | int]:
     """小規模なCPU探索を繰り返し、処理時間とノード処理速度を返す。"""
@@ -731,7 +754,8 @@ def benchmark_cpu(
         max_depth=depth + 1,
         target=0,
         cols=cols,
-        beam_width=beam_width,
+        beam_top_k=beam_top_k,
+        beam_max_candidates=beam_max_candidates,
         progress_mininterval=0,
         postfix_update_interval=max(1, cols),
         backend="cpu",
@@ -752,7 +776,8 @@ def benchmark_cpu(
         "repeats": repeats,
         "depth": depth,
         "cols": cols,
-        "beam_width": beam_width,
+        "beam_top_k": beam_top_k,
+        "beam_max_candidates": beam_max_candidates,
         "elapsed_seconds": elapsed,
         "nodes": nodes,
         "nodes_per_second": nodes / elapsed if elapsed else 0.0,
@@ -782,8 +807,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                         help="depthがこの値と一致するとき、--targetによる追加打ち切りを有効にする。")
     parser.add_argument("-t", "--target", type=int, default=cfg.target,
                         help="depth == max-depth のとき、countがこの値を超えたら結果を採用せず打ち切る。")
-    parser.add_argument("--beam-width", type=int, default=cfg.beam_width,
-                        help="各階層から次の階層へ渡す候補数。")
+    parser.add_argument("--beam-top-k", type=int, default=cfg.beam_top_k,
+                        help="各階層でcountの上位何位まで(タイは全て含む)を次の階層へ渡すか。")
+    parser.add_argument("--beam-max-candidates", type=int, default=cfg.beam_max_candidates,
+                        help="各階層から次の階層へ渡す候補数の上限。")
     parser.add_argument("-p", "--primes-count", type=int, default=None, metavar="N",
                         help="PRIMESの先頭N個だけを使う(未指定なら全て使用)。")
     parser.add_argument("--cols", type=int, default=cfg.cols,
@@ -818,7 +845,8 @@ if __name__ == "__main__":
             depth=min(args.depth, args.primes_count or args.depth),
             primes_count=args.primes_count or args.depth,
             cols=args.cols,
-            beam_width=args.beam_width,
+            beam_top_k=args.beam_top_k,
+            beam_max_candidates=args.beam_max_candidates,
             repeats=getattr(args, "benchmark_repeats", 3),
         )
         print(json.dumps(benchmark, ensure_ascii=False, indent=2))
@@ -831,7 +859,8 @@ if __name__ == "__main__":
     limit = args.limit
     max_depth = args.max_depth
     target = args.target
-    beam_width = args.beam_width
+    beam_top_k = args.beam_top_k
+    beam_max_candidates = args.beam_max_candidates
     cols = args.cols
     primes = PRIMES if args.primes_count is None else PRIMES[: args.primes_count]
     output_path = args.output
@@ -845,7 +874,8 @@ if __name__ == "__main__":
         limit=limit,
         max_depth=max_depth,
         target=target,
-        beam_width=beam_width,
+        beam_top_k=beam_top_k,
+        beam_max_candidates=beam_max_candidates,
         cols=cols,
         progress_mininterval=args.mininterval,
         postfix_update_interval=cfg.postfix_update_interval,
@@ -854,7 +884,10 @@ if __name__ == "__main__":
     )
 
     logger.info("HLSearch_Beam 開始 (log file: %s)", LOG_PATH)
-    logger.info("設定: depth=%d limit=%d max_depth=%d target=%d beam_width=%d primes_count=%d backend=%s", depth, limit, max_depth, target, beam_width, len(primes), backend)
+    logger.info(
+        "設定: depth=%d limit=%d max_depth=%d target=%d beam_top_k=%d beam_max_candidates=%d primes_count=%d backend=%s",
+        depth, limit, max_depth, target, beam_top_k, beam_max_candidates, len(primes), backend,
+    )
 
     shift_table = build_packed_shift_table(primes[:depth], cols)
     state = State(config, shift_table, checkpoint_path=args.checkpoint, checkpoint_interval=max(1, min(10000, max(10, depth * 100))))
